@@ -74,7 +74,7 @@ pub fn find_claude_binary(app_handle: &tauri::AppHandle) -> Result<String, Strin
 
     if installations.is_empty() {
         error!("Could not find claude binary in any location");
-        return Err("Claude Code not found. Please ensure it's installed in one of these locations: PATH, /usr/local/bin, /opt/homebrew/bin, ~/.nvm/versions/node/*/bin, ~/.claude/local, ~/.local/bin".to_string());
+        return Err("Claude Code not found. Please ensure it's installed. Common locations: /opt/homebrew/bin/claude (Apple Silicon), /usr/local/bin/claude (Intel Mac), or install via: curl -fsSL https://claude.ai/install.sh | sh".to_string());
     }
 
     // Log all found installations
@@ -253,13 +253,14 @@ fn find_nvm_installations() -> Vec<ClaudeInstallation> {
 fn find_standard_installations() -> Vec<ClaudeInstallation> {
     let mut installations = Vec::new();
 
-    // Common installation paths for claude
+    // Common installation paths for claude - order matters for preference
     let mut paths_to_check: Vec<(String, String)> = vec![
-        ("/usr/local/bin/claude".to_string(), "system".to_string()),
+        // Prioritize Homebrew installations as they're more likely to be up-to-date
         (
             "/opt/homebrew/bin/claude".to_string(),
             "homebrew".to_string(),
         ),
+        ("/usr/local/bin/claude".to_string(), "homebrew".to_string()),
         ("/usr/bin/claude".to_string(), "system".to_string()),
         ("/bin/claude".to_string(), "system".to_string()),
     ];
@@ -447,16 +448,152 @@ fn compare_versions(a: &str, b: &str) -> Ordering {
     Ordering::Equal
 }
 
+/// Helper function to build an enhanced PATH that includes common binary locations
+/// This ensures that Node.js and other dependencies can be found
+pub fn build_enhanced_path() -> String {
+    // Get current PATH or use a default minimal PATH
+    let mut path = std::env::var("PATH").unwrap_or_else(|_| {
+        "/usr/bin:/bin:/usr/sbin:/sbin".to_string()
+    });
+
+    // Add common binary paths for macOS
+    let additional_paths = vec![
+        "/opt/homebrew/bin",      // Homebrew on Apple Silicon
+        "/usr/local/bin",         // Homebrew on Intel / general binaries
+        "/opt/homebrew/sbin",     // Homebrew sbin on Apple Silicon
+        "/usr/local/sbin",        // General sbin
+    ];
+
+    // Add user-specific paths if HOME is available
+    if let Ok(home) = std::env::var("HOME") {
+        let user_paths = vec![
+            format!("{}/.local/bin", home),
+            format!("{}/.cargo/bin", home),
+            format!("{}/.npm-global/bin", home),
+            format!("{}/.yarn/bin", home),
+            format!("{}/.bun/bin", home),
+            format!("{}/bin", home),
+        ];
+        
+        for user_path in user_paths {
+            if !path.contains(&user_path) && PathBuf::from(&user_path).exists() {
+                path = format!("{}:{}", user_path, path);
+                debug!("Adding user path to PATH: {}", user_path);
+            }
+        }
+    }
+
+    // Add NVM Node.js paths first (higher priority)
+    if let Ok(home) = std::env::var("HOME") {
+        let nvm_dir = PathBuf::from(&home).join(".nvm");
+        
+        // Check if NVM is installed
+        if nvm_dir.exists() {
+            // Add NVM bin directory to PATH
+            let nvm_bin = nvm_dir.join("versions").join("node");
+            if nvm_bin.exists() {
+                // Find the active node version or use the latest
+                let mut node_versions = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&nvm_bin) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            node_versions.push(entry.path());
+                        }
+                    }
+                }
+                
+                // Sort versions (newest first) 
+                node_versions.sort_by(|a, b| {
+                    let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    b_name.cmp(a_name) // Reverse order for newest first
+                });
+                
+                // Add the newest version's bin directory to PATH
+                if let Some(latest_version) = node_versions.first() {
+                    let node_bin_path = latest_version.join("bin");
+                    if node_bin_path.exists() {
+                        let node_bin_str = node_bin_path.to_string_lossy();
+                        if !path.contains(&node_bin_str.as_ref()) {
+                            path = format!("{}:{}", node_bin_str, path);
+                            debug!("Adding NVM Node.js directory to PATH: {}", node_bin_str);
+                        }
+                    }
+                }
+            }
+            
+            // Also add NVM directory itself if it has a bin
+            let nvm_bin_dir = nvm_dir.join("bin");
+            if nvm_bin_dir.exists() {
+                let nvm_bin_str = nvm_bin_dir.to_string_lossy();
+                if !path.contains(&nvm_bin_str.as_ref()) {
+                    path = format!("{}:{}", nvm_bin_str, path);
+                    debug!("Adding NVM bin directory to PATH: {}", nvm_bin_str);
+                }
+            }
+        }
+    }
+
+    // Add standard Node.js paths as fallback
+    let node_paths = vec![
+        "/usr/local/bin/node",
+        "/opt/homebrew/bin/node",
+        "/usr/bin/node",
+    ];
+
+    // Find Node.js installation and add its parent to PATH
+    for node_path in &node_paths {
+        if PathBuf::from(node_path).exists() {
+            if let Some(parent) = PathBuf::from(node_path).parent() {
+                let parent_str = parent.to_string_lossy();
+                if !path.contains(&parent_str.as_ref()) {
+                    path = format!("{}:{}", parent_str, path);
+                    debug!("Adding Node.js directory to PATH: {}", parent_str);
+                }
+            }
+        }
+    }
+
+    // Add the additional paths to PATH if they exist and aren't already included
+    for additional_path in &additional_paths {
+        if !path.contains(additional_path) && PathBuf::from(additional_path).exists() {
+            path = format!("{}:{}", additional_path, path);
+            debug!("Adding {} to PATH", additional_path);
+        }
+    }
+
+    debug!("Enhanced PATH: {}", path);
+    path
+}
+
 /// Helper function to create a Command with proper environment variables
 /// This ensures commands like Claude can find Node.js and other dependencies
 pub fn create_command_with_env(program: &str) -> Command {
     let mut cmd = Command::new(program);
 
-    // Inherit essential environment variables from parent process
+    // Use the enhanced PATH
+    let mut path = build_enhanced_path();
+
+    // Add NVM support if the program is in an NVM directory
+    if program.contains("/.nvm/versions/node/") {
+        if let Some(node_bin_dir) = std::path::Path::new(program).parent() {
+            // Ensure the Node.js bin directory is in PATH
+            let node_bin_str = node_bin_dir.to_string_lossy();
+            if !path.contains(&node_bin_str.as_ref()) {
+                path = format!("{}:{}", node_bin_str, path);
+                debug!("Adding NVM bin directory to PATH: {}", node_bin_str);
+            }
+        }
+    }
+
+    // Set the final PATH
+    cmd.env("PATH", &path);
+    debug!("Final PATH for system command: {}", path);
+
+    // Inherit other essential environment variables from parent process
     for (key, value) in std::env::vars() {
-        // Pass through PATH and other essential environment variables
-        if key == "PATH"
-            || key == "HOME"
+        // Pass through other essential environment variables (not PATH since we set it above)
+        if key == "HOME"
             || key == "USER"
             || key == "SHELL"
             || key == "LANG"
@@ -470,20 +607,6 @@ pub fn create_command_with_env(program: &str) -> Command {
         {
             debug!("Inheriting env var: {}={}", key, value);
             cmd.env(&key, &value);
-        }
-    }
-
-    // Add NVM support if the program is in an NVM directory
-    if program.contains("/.nvm/versions/node/") {
-        if let Some(node_bin_dir) = std::path::Path::new(program).parent() {
-            // Ensure the Node.js bin directory is in PATH
-            let current_path = std::env::var("PATH").unwrap_or_default();
-            let node_bin_str = node_bin_dir.to_string_lossy();
-            if !current_path.contains(&node_bin_str.as_ref()) {
-                let new_path = format!("{}:{}", node_bin_str, current_path);
-                debug!("Adding NVM bin directory to PATH: {}", node_bin_str);
-                cmd.env("PATH", new_path);
-            }
         }
     }
 

@@ -225,16 +225,31 @@ fn extract_first_user_message(jsonl_path: &PathBuf) -> (Option<String>, Option<S
 /// Helper function to create a tokio Command with proper environment variables
 /// This ensures commands like Claude can find Node.js and other dependencies
 fn create_command_with_env(program: &str) -> Command {
-    // Convert std::process::Command to tokio::process::Command
-    let _std_cmd = crate::claude_binary::create_command_with_env(program);
-
     // Create a new tokio Command from the program path
     let mut tokio_cmd = Command::new(program);
 
-    // Copy over all environment variables
+    // Use the enhanced PATH that includes common binary locations
+    let mut enhanced_path = crate::claude_binary::build_enhanced_path();
+    
+    // Add NVM support if the program is in an NVM directory
+    if program.contains("/.nvm/versions/node/") {
+        if let Some(node_bin_dir) = std::path::Path::new(program).parent() {
+            let node_bin_str = node_bin_dir.to_string_lossy();
+            if !enhanced_path.contains(&node_bin_str.as_ref()) {
+                enhanced_path = format!("{}:{}", node_bin_str, enhanced_path);
+                log::debug!("Adding NVM bin directory to PATH: {}", node_bin_str);
+            }
+        }
+    }
+
+    // Set the enhanced PATH
+    tokio_cmd.env("PATH", &enhanced_path);
+    log::debug!("Set enhanced PATH for system command: {}", enhanced_path);
+
+    // Inherit other essential environment variables from parent process
     for (key, value) in std::env::vars() {
-        if key == "PATH"
-            || key == "HOME"
+        // Pass through other essential environment variables (not PATH since we set it above)
+        if key == "HOME"
             || key == "USER"
             || key == "SHELL"
             || key == "LANG"
@@ -251,21 +266,57 @@ fn create_command_with_env(program: &str) -> Command {
         }
     }
 
-    // Add NVM support if the program is in an NVM directory
-    if program.contains("/.nvm/versions/node/") {
-        if let Some(node_bin_dir) = std::path::Path::new(program).parent() {
-            let current_path = std::env::var("PATH").unwrap_or_default();
-            let node_bin_str = node_bin_dir.to_string_lossy();
-            if !current_path.contains(&node_bin_str.as_ref()) {
-                let new_path = format!("{}:{}", node_bin_str, current_path);
-                tokio_cmd.env("PATH", new_path);
-            }
-        }
-    }
-
     tokio_cmd
 }
 
+/// Determines whether to use sidecar or system binary execution
+fn should_use_sidecar(claude_path: &str) -> bool {
+    claude_path == "claude-code"
+}
+
+/// Creates a sidecar command with the given arguments
+fn create_sidecar_command(
+    app: &AppHandle,
+    args: Vec<String>,
+    project_path: &str,
+) -> Result<tauri_plugin_shell::process::Command, String> {
+    let mut sidecar_cmd = app
+        .shell()
+        .sidecar("claude-code")
+        .map_err(|e| format!("Failed to create sidecar command: {}", e))?;
+    
+    // Add all arguments
+    sidecar_cmd = sidecar_cmd.args(args);
+    
+    // Set working directory
+    sidecar_cmd = sidecar_cmd.current_dir(project_path);
+    
+    // Set enhanced PATH environment so sidecar can find Node.js and other dependencies
+    let enhanced_path = crate::claude_binary::build_enhanced_path();
+    sidecar_cmd = sidecar_cmd.env("PATH", &enhanced_path);
+    log::debug!("Set enhanced PATH for sidecar: {}", enhanced_path);
+    
+    // Inherit other essential environment variables
+    for (key, value) in std::env::vars() {
+        // Pass through other essential environment variables (not PATH since we set it above)
+        if key == "HOME"
+            || key == "USER"
+            || key == "SHELL"
+            || key == "LANG"
+            || key == "LC_ALL"
+            || key.starts_with("LC_")
+            || key == "NODE_PATH"
+            || key == "NVM_DIR"
+            || key == "NVM_BIN"
+            || key == "HOMEBREW_PREFIX"
+            || key == "HOMEBREW_CELLAR"
+        {
+            sidecar_cmd = sidecar_cmd.env(&key, &value);
+        }
+    }
+    
+    Ok(sidecar_cmd)
+}
 
 /// Creates a system binary command with the given arguments
 fn create_system_command(
